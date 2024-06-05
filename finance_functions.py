@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 from scipy.signal import find_peaks
 from scipy.stats import gaussian_kde
+from scipy.optimize import minimize
+from joblib import Parallel, delayed
 
 
 def max_drawdown_levels(series):
@@ -436,3 +438,89 @@ def past_future_window_correlations(input_series, window_sizes=[(10, 10), (20, 2
     
     return pd.DataFrame(results)
 
+
+
+
+def optimize_trades(df, direction, buy_ask_spread, min_sl_tp, max_sl_tp, start_sl=5, start_tp=10, window=100, n_jobs=-1):
+    """
+    Optimize stop loss and take profit values for maximizing CAGR per bar.
+
+    Parameters:
+    df (pd.DataFrame): DataFrame containing 'open', 'high', 'low', 'close' prices.
+    direction (str): Trading direction, either 'buy' or 'short sell'.
+    buy_ask_spread (float): Spread in value terms to account for in trade execution.
+    min_sl_tp (float): Minimum value to test for stop loss and take profit (difference to close).
+    max_sl_tp (float): Maximum value to test for stop loss and take profit (difference to close).
+    start_sl (float): Starting value for stop loss optimization.
+    start_tp (float): Starting value for take profit optimization.
+    window (int): Rolling window size for future bars to optimize over.
+    n_jobs (int): Number of CPU cores to use for parallel processing.
+
+    Returns:
+    pd.DataFrame: DataFrame with additional columns 'optimal_stop_loss' and 'optimal_take_profit'.
+    
+    Explanation:
+        This function uses the `pandas` library for data manipulation and `scipy.optimize` for optimization. 
+        The function is designed to be efficient by optimizing the stop loss and take profit values over a rolling 
+        window of future bars, and it is vectorized for speed.
+        Using `apply()` with `rolling()` can potentially improve speed and readability by leveraging vectorized operations and avoiding explicit loops. Below is a refactored version of the function using these techniques:
+        To further optimize the performance of this code:
+        1. Uses Parallel Processing: Utilize multiple CPU cores to handle rolling window computations in parallel.
+        2. Optimizes Vectorized Calculations: Ensure that calculations within the `calculate_cagr_per_bar` function are as vectorized as possible.
+        3. Avoids Unnecessary Computations: Only perform calculations for valid rolling windows.
+    
+    Example:
+    # Example usage
+    data = {
+        'open': [100, 102, 104, 103, 105, 106, 107, 108, 109, 110],
+        'high': [103, 104, 106, 105, 107, 108, 109, 110, 111, 112],
+        'low': [99, 100, 102, 101, 103, 104, 105, 106, 107, 108],
+        'close': [102, 104, 103, 105, 106, 107, 108, 109, 110, 111]
+    }
+    df = pd.DataFrame(data)
+
+    # Optimize for a buy direction with a buy-ask spread of 0.5, min and max bounds for sl/tp as 1 and 10
+    optimized_df = optimize_trades(df, direction='buy', buy_ask_spread=0.5, min_sl_tp=1, max_sl_tp=10, n_jobs=-1)
+    """
+
+    def calculate_cagr_per_bar(sl, tp, close, high, low):
+        entry_price = close[0] + buy_ask_spread if direction == 'buy' else close[0] - buy_ask_spread
+        if direction == 'buy':
+            profit = np.where(high >= entry_price + tp, tp, 
+                              np.where(low <= entry_price - sl, -sl, close[-1] - entry_price))
+        else:
+            profit = np.where(low <= entry_price - tp, tp, 
+                              np.where(high >= entry_price + sl, -sl, entry_price - close[-1]))
+        cagr_per_bar = np.mean(profit) / entry_price
+        return -cagr_per_bar  # Minimize negative CAGR to maximize CAGR
+
+    def optimize_row(rolling_window):
+        if len(rolling_window) < window:
+            return np.nan, np.nan  # Return NaN for incomplete windows
+
+        close = rolling_window['close'].values
+        high = rolling_window['high'].values
+        low = rolling_window['low'].values
+
+        bounds = [(min_sl_tp, max_sl_tp), (min_sl_tp, max_sl_tp)]
+        result = minimize(lambda x: calculate_cagr_per_bar(x[0], x[1], close, high, low),
+                          [start_sl, start_tp], bounds=bounds)
+        return result.x
+
+    # Initialize columns
+    df['optimal_stop_loss'] = np.nan
+    df['optimal_take_profit'] = np.nan
+
+    # Apply optimization in parallel
+    rolling_windows = [df.iloc[i:i + window] for i in range(len(df) - window + 1)]
+    results = Parallel(n_jobs=n_jobs)(delayed(optimize_row)(window) for window in rolling_windows)
+
+    # Fill results back into the DataFrame
+    for i, (opt_sl, opt_tp) in enumerate(results):
+        df.loc[df.index[i], 'optimal_stop_loss'] = opt_sl
+        df.loc[df.index[i], 'optimal_take_profit'] = opt_tp
+
+    df['optimal_stop_loss'] = df['close'] - df['optimal_stop_loss']
+    df['optimal_take_profit'] = df['optimal_take_profit'] - df['close']
+    
+    return df
